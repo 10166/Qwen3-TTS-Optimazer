@@ -88,15 +88,17 @@ class EmbeddingBuilder:
         language_id = self._resolve_language_id(request)
 
         # --- Build tts_bos, tts_eos, tts_pad embeddings ---
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.talker.text_projection(
-            self.talker.get_text_embeddings()(
-                torch.tensor(
-                    [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-                    device=self.device,
-                    dtype=input_id.dtype,
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = (
+            t.clone() for t in self.talker.text_projection(
+                self.talker.get_text_embeddings()(
+                    torch.tensor(
+                        [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                        device=self.device,
+                        dtype=input_id.dtype,
+                    )
                 )
-            )
-        ).chunk(3, dim=1)  # 3 × (1, 1, D)
+            ).chunk(3, dim=1)
+        )  # 3 × (1, 1, D) — cloned to avoid CUDA Graph buffer overwrite
 
         # --- Build codec prefix embedding ---
         codec_input_embedding = self._build_codec_prefix(input_id, language_id, speaker_embed)

@@ -40,6 +40,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
   - [Voice Clone with Continuous Batching](#voice-clone-with-continuous-batching)
   - [Background Generation](#background-generation)
   - [API Reference](#api-reference)
+- [FastAPI Server](#fastapi-server)
 - [torch.compile Acceleration](#torchcompile-acceleration)
 - [vLLM Usage](#vllm-usage)
 - [Fine Tuning](#fine-tuning)
@@ -590,6 +591,103 @@ engine.stop_background()
 | `get_result(request_id)` | Get result `(waveform, sample_rate)` if completed |
 | `is_complete(request_id)` | Check if request has completed |
 | `wait_for_result(request_id, timeout)` | Block until request completes |
+
+
+## FastAPI Server
+
+We provide a FastAPI-based HTTP server with continuous batching support, allowing you to deploy Qwen3-TTS as a REST API service. The server supports all three generation modes (Custom Voice, Voice Design, Voice Clone) and can load multiple models simultaneously.
+
+### Launch Server
+
+```bash
+# Load a single model (e.g., CustomVoice)
+python -m qwen_tts.server.app \
+    --custom-voice-model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+
+# Load multiple models simultaneously
+python -m qwen_tts.server.app \
+    --base-model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --custom-voice-model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --voice-design-model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+
+# With torch.compile and flash_attention_2
+python -m qwen_tts.server.app \
+    --custom-voice-model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --attn-implementation flash_attention_2 \
+    --enable-compile \
+    --max-batch-size 32
+```
+
+### Server Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--base-model` | `str` | `None` | Path or model ID for the Base model (voice clone) |
+| `--custom-voice-model` | `str` | `None` | Path or model ID for the CustomVoice model |
+| `--voice-design-model` | `str` | `None` | Path or model ID for the VoiceDesign model |
+| `--device` | `str` | `cuda:0` | Device to load models on |
+| `--dtype` | `str` | `bfloat16` | Model dtype (`bfloat16`, `float16`, `float32`) |
+| `--attn-implementation` | `str` | `sdpa` | Attention implementation (`sdpa`, `flash_attention_2`, `eager`) |
+| `--max-batch-size` | `int` | `16` | Maximum batch size for continuous batching |
+| `--enable-compile` | flag | `False` | Enable `torch.compile` for acceleration |
+| `--compile-backend` | `str` | `inductor` | `torch.compile` backend |
+| `--compile-mode` | `str` | `reduce-overhead` | `torch.compile` mode |
+| `--host` | `str` | `0.0.0.0` | Server listen host |
+| `--port` | `int` | `8080` | Server listen port |
+| `--request-timeout` | `float` | `300.0` | Request timeout in seconds |
+
+> **Note**: At least one model must be specified (`--base-model`, `--custom-voice-model`, or `--voice-design-model`). Each loaded model runs its own `ContinuousBatchingEngine` instance.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check, returns loaded models |
+| `/model_info` | GET | Returns model info (speakers, languages, features) |
+| `/speakers` | GET | Returns available speakers for CustomVoice model |
+| `/tts/custom_voice` | POST | Custom voice TTS (JSON body) |
+| `/tts/voice_design` | POST | Voice design TTS (JSON body) |
+| `/tts/clone` | POST | Voice clone TTS (multipart form) |
+| `/tts` | POST | Unified endpoint supporting all modes (multipart form) |
+
+### Usage Examples
+
+```bash
+# Custom Voice
+curl -X POST http://localhost:8080/tts/custom_voice \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello, this is a test.", "language": "English", "speaker": "Ryan"}' \
+  --output output.wav
+
+# Voice Design
+curl -X POST http://localhost:8080/tts/voice_design \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello world!", "language": "English", "instruct": "A warm and gentle female voice."}' \
+  --output output.wav
+
+# Voice Clone (with audio file)
+curl -X POST http://localhost:8080/tts/clone \
+  -F "text=Hello, this is a cloned voice." \
+  -F "language=English" \
+  -F "ref_audio_file=@reference.wav" \
+  -F "ref_text=The transcript of the reference audio." \
+  --output output.wav
+
+# Voice Clone (reuse cache key from previous response header X-Cache-Key)
+curl -X POST http://localhost:8080/tts/clone \
+  -F "text=Another sentence in the same voice." \
+  -F "language=English" \
+  -F "cache_key=<cache_key_from_previous_response>" \
+  --output output.wav
+
+# Unified endpoint
+curl -X POST http://localhost:8080/tts \
+  -F "text=Hello world!" \
+  -F "mode=custom_voice" \
+  -F "language=English" \
+  -F "speaker=Ryan" \
+  --output output.wav
+```
 
 
 ## torch.compile Acceleration

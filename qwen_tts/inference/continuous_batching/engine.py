@@ -22,6 +22,7 @@ management, and early completion for short requests.
 
 import logging
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -227,6 +228,27 @@ class ContinuousBatchingEngine:
         """
         self._generation_loop()
 
+    def warmup(self, request: TTSRequest) -> None:
+        """Run a dummy request through the full pipeline to trigger torch.compile.
+
+        This should be called BEFORE start_background(). The generated audio
+        is discarded. If the warmup request fails, a warning is logged but
+        the engine continues normally.
+        """
+        logger.info("Starting warmup (torch.compile, may take several minutes) ...")
+        t0 = time.monotonic()
+        self.add_request(request)
+        try:
+            self._generation_loop()
+        except Exception as e:
+            logger.warning("Warmup generation failed: %s (non-fatal)", e, exc_info=True)
+        # Discard result
+        with self._lock:
+            self._completed.pop(request.request_id, None)
+            self._result_event.pop(request.request_id, None)
+        elapsed = time.monotonic() - t0
+        logger.info("Warmup completed in %.1fs", elapsed)
+
     def start_background(self) -> None:
         """Start the generation loop in a background thread."""
         if self._bg_thread is not None and self._bg_thread.is_alive():
@@ -304,6 +326,7 @@ class ContinuousBatchingEngine:
                 del self._pending[rid]
                 self._active[rid] = state
 
+    @torch.inference_mode()
     def _prefill_new_requests(self) -> None:
         """Prefill requests that are in active but still PENDING status."""
         with self._lock:

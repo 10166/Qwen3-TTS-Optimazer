@@ -30,9 +30,23 @@ class PerRequestKVCacheManager:
         return DynamicCache()
 
     @staticmethod
-    def _set_seen_tokens(cache: DynamicCache, seq_length: int) -> None:
-        """Set the internal _seen_tokens counter on a DynamicCache."""
-        cache._seen_tokens = seq_length
+    def _get_num_layers(cache: DynamicCache) -> int:
+        return len(cache.layers)
+
+    @staticmethod
+    def _get_layer_kv(cache: DynamicCache, layer_idx: int):
+        """Return (keys, values) tensors for a given layer."""
+        layer = cache.layers[layer_idx]
+        return layer.keys, layer.values
+
+    @staticmethod
+    def _build_cache_from_kv_list(kv_pairs: List) -> DynamicCache:
+        """Build a DynamicCache from a list of (key, value) tensor pairs per layer."""
+        cache = DynamicCache()
+        for layer_idx, (k, v) in enumerate(kv_pairs):
+            # update() on a fresh cache initializes the layer and sets keys/values
+            cache.update(k, v, layer_idx)
+        return cache
 
     @staticmethod
     def assemble_batch_cache(
@@ -55,15 +69,14 @@ class PerRequestKVCacheManager:
         if not states:
             return DynamicCache()
 
-        num_layers = len(states[0].talker_kv_cache.key_cache)
-        batched_cache = DynamicCache()
+        num_layers = PerRequestKVCacheManager._get_num_layers(states[0].talker_kv_cache)
+        kv_pairs = []
 
         for layer_idx in range(num_layers):
             keys = []
             values = []
             for state in states:
-                k = state.talker_kv_cache.key_cache[layer_idx]    # (1, H, S_i, D)
-                v = state.talker_kv_cache.value_cache[layer_idx]  # (1, H, S_i, D)
+                k, v = PerRequestKVCacheManager._get_layer_kv(state.talker_kv_cache, layer_idx)
                 seq_len = k.shape[2]
                 if seq_len < max_cache_len:
                     pad_len = max_cache_len - seq_len
@@ -74,14 +87,9 @@ class PerRequestKVCacheManager:
 
             batched_k = torch.cat(keys, dim=0)   # (B, H, max_cache_len, D)
             batched_v = torch.cat(values, dim=0)  # (B, H, max_cache_len, D)
+            kv_pairs.append((batched_k, batched_v))
 
-            batched_cache.key_cache.append(batched_k)
-            batched_cache.value_cache.append(batched_v)
-
-        # Set _seen_tokens to max_cache_len so cache_position is computed correctly
-        PerRequestKVCacheManager._set_seen_tokens(batched_cache, max_cache_len)
-
-        return batched_cache
+        return PerRequestKVCacheManager._build_cache_from_kv_list(kv_pairs)
 
     @staticmethod
     def disassemble_batch_cache(
@@ -104,16 +112,17 @@ class PerRequestKVCacheManager:
             max_cache_len: The max_cache_len used when assembling (before forward).
             new_tokens: Number of new tokens appended during the forward pass.
         """
-        num_layers = len(batched_cache.key_cache)
+        num_layers = PerRequestKVCacheManager._get_num_layers(batched_cache)
 
         for i, state in enumerate(states):
             old_len = state.cache_seq_length
             new_len = old_len + new_tokens
-            new_cache = DynamicCache()
+            kv_pairs = []
 
             for layer_idx in range(num_layers):
-                k_full = batched_cache.key_cache[layer_idx][i: i + 1]   # (1, H, max_cache_len + new_tokens, D)
-                v_full = batched_cache.value_cache[layer_idx][i: i + 1]
+                k_full, v_full = PerRequestKVCacheManager._get_layer_kv(batched_cache, layer_idx)
+                k_full = k_full[i: i + 1]   # (1, H, max_cache_len + new_tokens, D)
+                v_full = v_full[i: i + 1]
 
                 # Take valid old entries + new entries
                 k_old = k_full[:, :, :old_len, :]
@@ -123,10 +132,7 @@ class PerRequestKVCacheManager:
 
                 k = torch.cat([k_old, k_new], dim=2).clone()  # (1, H, new_len, D)
                 v = torch.cat([v_old, v_new], dim=2).clone()
+                kv_pairs.append((k, v))
 
-                new_cache.key_cache.append(k)
-                new_cache.value_cache.append(v)
-
-            PerRequestKVCacheManager._set_seen_tokens(new_cache, new_len)
-            state.talker_kv_cache = new_cache
+            state.talker_kv_cache = PerRequestKVCacheManager._build_cache_from_kv_list(kv_pairs)
             state.cache_seq_length = new_len

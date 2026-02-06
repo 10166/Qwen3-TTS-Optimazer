@@ -2,13 +2,14 @@
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -52,34 +53,53 @@ def numpy_to_wav_bytes(waveform: np.ndarray, sr: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# VoiceCloneCache — caches the most recent voice clone prompt
+# VoiceCloneCache — LRU cache keyed by content hash
 # ---------------------------------------------------------------------------
 
 
 class VoiceCloneCache:
-    """Caches the single most-recent VoiceClonePromptItem (matches protocol `use_cache` semantics)."""
+    """Caches VoiceClonePromptItems keyed by hash(audio + ref_text + x_vector_only_mode)."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_size: int = 100) -> None:
         self._lock = threading.Lock()
-        self._item: Optional[VoiceClonePromptItem] = None
-        self._updated_at: float = 0.0
+        self._cache: Dict[str, Tuple[VoiceClonePromptItem, float]] = {}
+        self._max_size = max_size
 
-    def set(self, item: VoiceClonePromptItem) -> None:
-        with self._lock:
-            self._item = item
-            self._updated_at = time.time()
+    @staticmethod
+    def compute_key(
+        audio_identity: bytes,
+        ref_text: Optional[str],
+        x_vector_only_mode: bool,
+    ) -> str:
+        h = hashlib.sha256()
+        h.update(audio_identity)
+        h.update((ref_text or "").encode("utf-8"))
+        h.update(b"\x01" if x_vector_only_mode else b"\x00")
+        return h.hexdigest()[:16]
 
-    def get(self) -> Optional[VoiceClonePromptItem]:
+    def get(self, key: str) -> Optional[VoiceClonePromptItem]:
         with self._lock:
-            return self._item
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            item, _ = entry
+            self._cache[key] = (item, time.time())
+            return item
 
-    def is_cached(self) -> bool:
+    def set(self, key: str, item: VoiceClonePromptItem) -> None:
         with self._lock:
-            return self._item is not None
+            if key not in self._cache and len(self._cache) >= self._max_size:
+                oldest_key = min(self._cache, key=lambda k: self._cache[k][1])
+                del self._cache[oldest_key]
+            self._cache[key] = (item, time.time())
 
-    def get_updated_at(self) -> float:
+    def info(self) -> Dict[str, Any]:
         with self._lock:
-            return self._updated_at
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "keys": list(self._cache.keys()),
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +150,39 @@ class ModelRegistry:
             compile_backend=compile_backend,
             compile_mode=compile_mode,
         )
+
+        if enable_compile:
+            warmup_req = self._build_warmup_request(model_type)
+            engine.warmup(warmup_req)
+
         engine.start_background()
 
         self.models[model_type] = wrapper
         self.engines[model_type] = engine
         logger.info("Loaded %s model successfully.", model_type)
+
+    @staticmethod
+    def _build_warmup_request(model_type: str) -> TTSRequest:
+        """Build a minimal TTSRequest for warmup based on model type."""
+        if model_type == "voice_design":
+            return TTSRequest(
+                request_id="__warmup__",
+                mode=GenerationMode.VOICE_DESIGN,
+                text="Warmup.",
+                language="Auto",
+                instruct="A warm voice.",
+                max_new_tokens=10,
+            )
+        else:
+            # custom_voice and base models share the same talker pipeline;
+            # CUSTOM_VOICE mode without speaker works on all model types.
+            return TTSRequest(
+                request_id="__warmup__",
+                mode=GenerationMode.CUSTOM_VOICE,
+                text="Warmup.",
+                language="Auto",
+                max_new_tokens=10,
+            )
 
     def get_engine(self, model_type: str) -> ContinuousBatchingEngine:
         engine = self.engines.get(model_type)
@@ -220,10 +268,7 @@ def speakers():
 
 @app.get("/tts/clone_cache")
 def get_clone_cache():
-    return {
-        "cached": clone_cache.is_cached(),
-        "updated_at": clone_cache.get_updated_at(),
-    }
+    return clone_cache.info()
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +276,11 @@ def get_clone_cache():
 # ---------------------------------------------------------------------------
 
 
-async def _submit_and_wait(engine: ContinuousBatchingEngine, request: TTSRequest) -> Response:
+async def _submit_and_wait(
+    engine: ContinuousBatchingEngine,
+    request: TTSRequest,
+    cache_key: Optional[str] = None,
+) -> Response:
     """Submit a TTSRequest to the engine and return a WAV response."""
     logger.info("Request %s [%s] text=%r", request.request_id, request.mode.value, request.text[:80])
     engine.add_request(request)
@@ -249,12 +298,12 @@ async def _submit_and_wait(engine: ContinuousBatchingEngine, request: TTSRequest
     elapsed = time.monotonic() - t0
     logger.info("Request %s completed in %.2fs, audio=%.2fs", request.request_id, elapsed, len(waveform) / sr)
 
+    headers: Dict[str, str] = {"Content-Disposition": "attachment; filename=output.wav"}
+    if cache_key:
+        headers["X-Cache-Key"] = cache_key
+
     wav_bytes = numpy_to_wav_bytes(waveform, sr)
-    return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=output.wav"},
-    )
+    return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
 
 
 def _voice_clone_prompt_item_to_dict(item: VoiceClonePromptItem) -> Dict[str, Any]:
@@ -344,15 +393,21 @@ async def _build_clone_prompt(
     ref_audio: Any = None,
     ref_audio_file: Optional[UploadFile] = None,
     ref_text: Optional[str] = None,
-    use_cache: bool = False,
+    cache_key: Optional[str] = None,
     x_vector_only_mode: bool = False,
-) -> VoiceClonePromptItem:
-    """Build or retrieve a VoiceClonePromptItem for voice clone requests."""
-    if use_cache:
-        item = clone_cache.get()
+) -> Tuple[VoiceClonePromptItem, str]:
+    """Build or retrieve a VoiceClonePromptItem. Returns (item, cache_key)."""
+
+    # Direct cache_key lookup (e.g. reuse a previously returned X-Cache-Key)
+    if cache_key:
+        item = clone_cache.get(cache_key)
         if item is None:
-            raise HTTPException(status_code=400, detail="No cached reference audio")
-        return item
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cache key '{cache_key}' not found or expired",
+            )
+        logger.info("Clone prompt cache hit (key=%s)", cache_key)
+        return item, cache_key
 
     # ICL mode (x_vector_only_mode=False) requires ref_text
     if not x_vector_only_mode and not ref_text:
@@ -362,19 +417,32 @@ async def _build_clone_prompt(
             "Provide ref_text or set x_vector_only_mode=true.",
         )
 
-    # Determine audio source
+    # Determine audio source & compute cache key from content
     audio_input: Any = None
+    audio_identity: bytes
     if ref_audio_file is not None:
         raw = await ref_audio_file.read()
         audio_data, sr = sf.read(BytesIO(raw))
         audio_input = (audio_data, sr)
+        audio_identity = raw
     elif ref_audio is not None:
         audio_input = ref_audio  # URL or base64 string
+        audio_identity = ref_audio.encode("utf-8")
     else:
         raise HTTPException(
-            status_code=400, detail="ref_audio or ref_audio_file required when use_cache is false"
+            status_code=400,
+            detail="ref_audio, ref_audio_file, or cache_key is required",
         )
 
+    key = clone_cache.compute_key(audio_identity, ref_text, x_vector_only_mode)
+
+    # Check cache
+    cached = clone_cache.get(key)
+    if cached is not None:
+        logger.info("Clone prompt cache hit (key=%s)", key)
+        return cached, key
+
+    # Cache miss — run expensive preprocessing
     loop = asyncio.get_running_loop()
 
     def _create_prompt():
@@ -391,9 +459,9 @@ async def _build_clone_prompt(
         raise HTTPException(status_code=400, detail=f"Failed to process reference audio: {exc}")
 
     item = items[0]
-
-    clone_cache.set(item)
-    return item
+    clone_cache.set(key, item)
+    logger.info("Clone prompt cached (key=%s)", key)
+    return item, key
 
 
 @app.post("/tts/clone")
@@ -403,18 +471,18 @@ async def tts_clone(
     ref_audio: Optional[str] = Form(None),
     ref_audio_file: Optional[UploadFile] = File(None),
     ref_text: Optional[str] = Form(None),
-    use_cache: bool = Form(False),
+    cache_key: Optional[str] = Form(None),
     x_vector_only_mode: bool = Form(False),
 ):
     engine = registry.get_engine("base")
     wrapper = registry.get_model("base")
 
-    item = await _build_clone_prompt(
+    item, key = await _build_clone_prompt(
         wrapper,
         ref_audio=ref_audio,
         ref_audio_file=ref_audio_file,
         ref_text=ref_text,
-        use_cache=use_cache,
+        cache_key=cache_key,
         x_vector_only_mode=x_vector_only_mode,
     )
 
@@ -427,7 +495,7 @@ async def tts_clone(
         voice_clone_prompt=prompt_dict,
         ref_text=item.ref_text,
     )
-    return await _submit_and_wait(engine, req)
+    return await _submit_and_wait(engine, req, cache_key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +513,7 @@ async def tts_unified(
     ref_audio: Optional[str] = Form(None),
     ref_audio_file: Optional[UploadFile] = File(None),
     ref_text: Optional[str] = Form(None),
-    use_cache: bool = Form(False),
+    cache_key: Optional[str] = Form(None),
     x_vector_only_mode: bool = Form(False),
 ):
     if mode == "voice_design":
@@ -487,12 +555,12 @@ async def tts_unified(
         engine = registry.get_engine("base")
         wrapper = registry.get_model("base")
 
-        item = await _build_clone_prompt(
+        item, key = await _build_clone_prompt(
             wrapper,
             ref_audio=ref_audio,
             ref_audio_file=ref_audio_file,
             ref_text=ref_text,
-            use_cache=use_cache,
+            cache_key=cache_key,
             x_vector_only_mode=x_vector_only_mode,
         )
 
@@ -505,7 +573,7 @@ async def tts_unified(
             voice_clone_prompt=prompt_dict,
             ref_text=item.ref_text,
         )
-        return await _submit_and_wait(engine, req)
+        return await _submit_and_wait(engine, req, cache_key=key)
 
     else:
         raise HTTPException(
