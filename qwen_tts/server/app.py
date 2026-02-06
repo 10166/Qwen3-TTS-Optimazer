@@ -27,6 +27,13 @@ from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptIt
 
 logger = logging.getLogger(__name__)
 
+COMPILE_WARMUP_MAX_NEW_TOKENS = 320
+STARTUP_PREREQUEST_MAX_NEW_TOKENS = 320
+STARTUP_REF_AUDIO_SECONDS = 3.0
+WARMUP_TEXT = "今晚的风把窗帘吹得很轻，像有人在房间里慢慢走动。"
+WARMUP_REF_TEXT = "今晚的风把窗帘吹得很轻，像有人在房间里慢慢走动。"
+WARMUP_INSTRUCT = "温暖自然、贴耳近讲、语速中等。"
+
 # Speaker descriptions for CustomVoice model (9 speakers)
 SPEAKER_DESCRIPTIONS: Dict[str, str] = {
     "vivian": "A warm and gentle female voice, suitable for storytelling and narration.",
@@ -50,6 +57,14 @@ def numpy_to_wav_bytes(waveform: np.ndarray, sr: int) -> bytes:
     buf = BytesIO()
     sf.write(buf, waveform, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
+
+
+def build_startup_ref_audio(sr: int, duration_sec: float = STARTUP_REF_AUDIO_SECONDS) -> np.ndarray:
+    """Build deterministic reference audio for startup voice-clone prewarm."""
+    num_samples = int(sr * duration_sec)
+    timeline = np.arange(num_samples, dtype=np.float32) / float(sr)
+    waveform = 0.05 * np.sin(2 * np.pi * 220.0 * timeline)
+    return waveform.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +169,12 @@ class ModelRegistry:
         if enable_compile:
             warmup_req = self._build_warmup_request(model_type)
             engine.warmup(warmup_req)
+            if model_type == "base":
+                try:
+                    warmup_clone_req = self._build_voice_clone_warmup_request(wrapper)
+                    engine.warmup(warmup_clone_req)
+                except Exception:
+                    logger.warning("Voice-clone warmup failed (non-fatal)", exc_info=True)
 
         engine.start_background()
 
@@ -163,15 +184,15 @@ class ModelRegistry:
 
     @staticmethod
     def _build_warmup_request(model_type: str) -> TTSRequest:
-        """Build a minimal TTSRequest for warmup based on model type."""
+        """Build a realistic TTSRequest for compile warmup based on model type."""
         if model_type == "voice_design":
             return TTSRequest(
                 request_id="__warmup__",
                 mode=GenerationMode.VOICE_DESIGN,
-                text="Warmup.",
+                text=WARMUP_TEXT,
                 language="Auto",
-                instruct="A warm voice.",
-                max_new_tokens=10,
+                instruct=WARMUP_INSTRUCT,
+                max_new_tokens=COMPILE_WARMUP_MAX_NEW_TOKENS,
             )
         else:
             # custom_voice and base models share the same talker pipeline;
@@ -179,10 +200,40 @@ class ModelRegistry:
             return TTSRequest(
                 request_id="__warmup__",
                 mode=GenerationMode.CUSTOM_VOICE,
-                text="Warmup.",
+                text=WARMUP_TEXT,
                 language="Auto",
-                max_new_tokens=10,
+                max_new_tokens=COMPILE_WARMUP_MAX_NEW_TOKENS,
             )
+
+    def _build_voice_clone_warmup_request(self, wrapper: Qwen3TTSModel) -> TTSRequest:
+        """Build an extra voice-clone warmup request for base model compile coverage."""
+        ref_sr = int(getattr(wrapper.model, "speaker_encoder_sample_rate", 24000))
+        ref_audio = build_startup_ref_audio(ref_sr)
+        with self._preprocess_lock:
+            item = wrapper.create_voice_clone_prompt(
+                ref_audio=(ref_audio, ref_sr),
+                ref_text=WARMUP_REF_TEXT,
+                x_vector_only_mode=False,
+            )[0]
+
+        warmup_cache_key = clone_cache.compute_key(ref_audio.tobytes(), WARMUP_REF_TEXT, False)
+        clone_cache.set(warmup_cache_key, item)
+        logger.info("Warmup clone prompt cached (key=%s)", warmup_cache_key)
+
+        return TTSRequest(
+            request_id="__warmup_voice_clone__",
+            mode=GenerationMode.VOICE_CLONE,
+            text=WARMUP_TEXT,
+            language="Auto",
+            voice_clone_prompt={
+                "ref_code": item.ref_code,
+                "ref_spk_embedding": item.ref_spk_embedding,
+                "x_vector_only_mode": item.x_vector_only_mode,
+                "icl_mode": item.icl_mode,
+            },
+            ref_text=item.ref_text,
+            max_new_tokens=COMPILE_WARMUP_MAX_NEW_TOKENS,
+        )
 
     def get_engine(self, model_type: str) -> ContinuousBatchingEngine:
         engine = self.engines.get(model_type)
@@ -210,12 +261,123 @@ class ModelRegistry:
 registry = ModelRegistry()
 clone_cache = VoiceCloneCache()
 REQUEST_TIMEOUT: float = 300.0
+SERVER_READY: bool = False
+SERVER_STATUS: str = "initializing"
+
+
+def _set_server_status(ready: bool, status: str) -> None:
+    global SERVER_READY
+    global SERVER_STATUS
+    SERVER_READY = ready
+    SERVER_STATUS = status
+
+
+def _ensure_server_ready() -> None:
+    if not SERVER_READY:
+        raise HTTPException(status_code=503, detail=f"Service not ready: {SERVER_STATUS}")
+
+
+async def _build_startup_prerequest(model_type: str) -> TTSRequest:
+    """Build realistic startup pre-request for each loaded model."""
+    request_id = f"__startup_prerequest__{model_type}__{uuid.uuid4().hex[:8]}"
+
+    if model_type == "voice_design":
+        return TTSRequest(
+            request_id=request_id,
+            mode=GenerationMode.VOICE_DESIGN,
+            text=WARMUP_TEXT,
+            language="Auto",
+            instruct=WARMUP_INSTRUCT,
+            max_new_tokens=STARTUP_PREREQUEST_MAX_NEW_TOKENS,
+        )
+
+    if model_type == "custom_voice":
+        wrapper = registry.get_model("custom_voice")
+        speakers = wrapper.get_supported_speakers() or []
+        speaker = speakers[0] if speakers else None
+        return TTSRequest(
+            request_id=request_id,
+            mode=GenerationMode.CUSTOM_VOICE,
+            text=WARMUP_TEXT,
+            language="Auto",
+            speaker=speaker,
+            max_new_tokens=STARTUP_PREREQUEST_MAX_NEW_TOKENS,
+        )
+
+    if model_type == "base":
+        wrapper = registry.get_model("base")
+        ref_sr = int(getattr(wrapper.model, "speaker_encoder_sample_rate", 24000))
+        ref_audio = build_startup_ref_audio(ref_sr)
+        loop = asyncio.get_running_loop()
+
+        def _create_prompt() -> VoiceClonePromptItem:
+            with registry._preprocess_lock:
+                items = wrapper.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, ref_sr),
+                    ref_text=WARMUP_REF_TEXT,
+                    x_vector_only_mode=False,
+                )
+            return items[0]
+
+        item = await loop.run_in_executor(None, _create_prompt)
+        startup_cache_key = clone_cache.compute_key(ref_audio.tobytes(), WARMUP_REF_TEXT, False)
+        clone_cache.set(startup_cache_key, item)
+        logger.info("Startup clone prompt cached (key=%s)", startup_cache_key)
+
+        return TTSRequest(
+            request_id=request_id,
+            mode=GenerationMode.VOICE_CLONE,
+            text=WARMUP_TEXT,
+            language="Auto",
+            voice_clone_prompt={
+                "ref_code": item.ref_code,
+                "ref_spk_embedding": item.ref_spk_embedding,
+                "x_vector_only_mode": item.x_vector_only_mode,
+                "icl_mode": item.icl_mode,
+            },
+            ref_text=item.ref_text,
+            max_new_tokens=STARTUP_PREREQUEST_MAX_NEW_TOKENS,
+        )
+
+    raise ValueError(f"Unknown model type for startup pre-request: {model_type}")
+
+
+async def _run_startup_internal_prerequests() -> None:
+    """Run one realistic internal request per loaded model before marking ready."""
+    if not registry.engines:
+        logger.info("No loaded engines, skipping startup pre-request")
+        return
+
+    logger.info("Starting startup internal pre-requests ...")
+    loop = asyncio.get_running_loop()
+    for model_type, engine in registry.engines.items():
+        req = await _build_startup_prerequest(model_type)
+        t0 = time.monotonic()
+        engine.add_request(req)
+        try:
+            await loop.run_in_executor(None, engine.wait_for_result, req.request_id, REQUEST_TIMEOUT)
+        except Exception as exc:
+            raise RuntimeError(f"Startup pre-request failed for {model_type}: {exc}") from exc
+        elapsed = time.monotonic() - t0
+        logger.info("Startup pre-request for %s completed in %.2fs", model_type, elapsed)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    registry.shutdown()
+    _set_server_status(False, "startup_prewarm")
+    try:
+        await _run_startup_internal_prerequests()
+    except Exception:
+        _set_server_status(False, "startup_prewarm_failed")
+        logger.exception("Startup prewarm failed")
+        raise
+
+    _set_server_status(True, "ready")
+    try:
+        yield
+    finally:
+        _set_server_status(False, "shutting_down")
+        registry.shutdown()
 
 
 app = FastAPI(title="Qwen3-TTS Server", lifespan=lifespan)
@@ -229,7 +391,20 @@ app = FastAPI(title="Qwen3-TTS Server", lifespan=lifespan)
 @app.get("/health")
 def health():
     models = {name: name for name in registry.engines}
-    return {"ok": True, "models": models}
+    return {
+        "ok": True,
+        "ready": SERVER_READY,
+        "status": SERVER_STATUS,
+        "models": models,
+    }
+
+
+@app.get("/ready")
+def ready():
+    if not SERVER_READY:
+        raise HTTPException(status_code=503, detail=f"Service not ready: {SERVER_STATUS}")
+    models = {name: name for name in registry.engines}
+    return {"ok": True, "ready": True, "models": models}
 
 
 @app.get("/model_info")
@@ -344,6 +519,7 @@ class CustomVoiceBody(BaseModel):
 
 @app.post("/tts/voice_design")
 async def tts_voice_design(body: VoiceDesignBody):
+    _ensure_server_ready()
     engine = registry.get_engine("voice_design")
     req = TTSRequest(
         request_id=str(uuid.uuid4()),
@@ -362,6 +538,7 @@ async def tts_voice_design(body: VoiceDesignBody):
 
 @app.post("/tts/custom_voice")
 async def tts_custom_voice(body: CustomVoiceBody):
+    _ensure_server_ready()
     engine = registry.get_engine("custom_voice")
     wrapper = registry.get_model("custom_voice")
 
@@ -474,6 +651,7 @@ async def tts_clone(
     cache_key: Optional[str] = Form(None),
     x_vector_only_mode: bool = Form(False),
 ):
+    _ensure_server_ready()
     engine = registry.get_engine("base")
     wrapper = registry.get_model("base")
 
@@ -516,6 +694,7 @@ async def tts_unified(
     cache_key: Optional[str] = Form(None),
     x_vector_only_mode: bool = Form(False),
 ):
+    _ensure_server_ready()
     if mode == "voice_design":
         if not instruct:
             raise HTTPException(status_code=400, detail="'instruct' is required for voice_design mode")
@@ -598,7 +777,12 @@ def main():
     parser.add_argument("--max-batch-size", type=int, default=16)
     parser.add_argument("--enable-compile", action="store_true")
     parser.add_argument("--compile-backend", type=str, default="inductor")
-    parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        help="torch.compile mode (first-request latency priority enforces reduce-overhead)",
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--request-timeout", type=float, default=300.0)

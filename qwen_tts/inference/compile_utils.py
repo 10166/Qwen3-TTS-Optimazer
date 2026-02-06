@@ -38,11 +38,14 @@ def apply_torch_compile(model, backend="inductor", mode="reduce-overhead"):
         backend: torch.compile backend (default: "inductor").
         mode: torch.compile mode (default: "reduce-overhead").
     """
-    # Code predictor backbone — small transformer, called every generation step
+    # Code predictor backbone — small transformer, called every generation step.
+    # Use mode="default" (no CUDA Graphs) because prefill (seq_len=2) and decode
+    # (seq_len=1) have different shapes, causing CUDA graph tensor overwrite errors
+    # with reduce-overhead/max-autotune.
     model.talker.code_predictor.model = torch.compile(
-        model.talker.code_predictor.model, backend=backend, mode=mode
+        model.talker.code_predictor.model, backend=backend, mode="default"
     )
-    logger.info("Compiled talker.code_predictor.model with backend=%s, mode=%s", backend, mode)
+    logger.info("Compiled talker.code_predictor.model with backend=%s, mode=default", backend)
 
     # Tokenizer decoder forward — Conv + Transformer + Upsample
     # Only compile forward(), not chunked_decode() which has a while loop

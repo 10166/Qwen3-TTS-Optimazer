@@ -260,8 +260,14 @@ class TTSGenerationLoop:
     ) -> torch.Tensor:
         """Run code_predictor to generate codebooks 1..Q-1.
 
-        Uses the HF generate() for the code_predictor since it's a short sequence
-        (Q-1 steps) and doesn't need continuous batching.
+        Bypasses HF generate() with a direct autoregressive loop for:
+          - No GenerationConfig / StoppingCriteria / LogitsProcessor overhead
+          - No DynamicCache wrapper overhead
+          - Better CUDA graph compatibility (fixed shape per step)
+
+        Flow:
+          1. Prefill: [past_hidden, codebook-0_embed] → (1, 2, D) → lm_head[0] → sample codebook-1
+          2. Decode steps k=1..Q-2: embed prev token → (1, 1, D) → lm_head[k] → sample codebook-(k+1)
 
         Args:
             first_token: (1, 1) codebook-0 token ID.
@@ -272,29 +278,87 @@ class TTSGenerationLoop:
             (num_code_groups,) tensor of all codec IDs for this step.
         """
         req = state.request
+        code_predictor = self.talker.code_predictor
         num_groups = self.talker_config.num_code_groups
 
-        # Build input: [past_hidden, codebook-0_embed]
+        # --- Prefill: [past_hidden, codebook-0_embed] ---
         first_embed = self.talker.get_input_embeddings()(first_token)  # (1, 1, D)
         cp_input = torch.cat([past_hidden, first_embed], dim=1)  # (1, 2, D)
+        cp_input = code_predictor.small_to_mtp_projection(cp_input)
 
-        # Generate Q-1 tokens
-        predictor_result = self.talker.code_predictor.generate(
+        outputs = code_predictor.model(
+            input_ids=None,
             inputs_embeds=cp_input,
-            max_new_tokens=num_groups - 1,
-            do_sample=req.subtalker_dosample,
-            top_p=req.subtalker_top_p,
-            top_k=req.subtalker_top_k,
-            temperature=req.subtalker_temperature,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
+            use_cache=True,
         )
 
+        hidden_states = outputs.last_hidden_state  # (1, 2, D_cp)
+        logits = code_predictor.lm_head[0](hidden_states[:, -1:, :])  # (1, 1, vocab)
+
+        # Sample codebook-1
+        token = self._sample_cp_token(logits[:, -1, :], req)  # (1, 1)
+        generated_tokens = [token]
+
+        past_kv = outputs.past_key_values
+
+        # --- Decode steps: generate codebooks 2..Q-1 ---
+        for step in range(1, num_groups - 1):
+            # Embed previous token using per-codebook embedding
+            step_embed = code_predictor.model.codec_embedding[step - 1](token)  # (1, 1, D)
+            step_embed = code_predictor.small_to_mtp_projection(step_embed)
+
+            outputs = code_predictor.model(
+                input_ids=None,
+                inputs_embeds=step_embed,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+
+            hidden_states = outputs.last_hidden_state  # (1, 1, D_cp)
+            logits = code_predictor.lm_head[step](hidden_states[:, -1:, :])  # (1, 1, vocab)
+
+            token = self._sample_cp_token(logits[:, -1, :], req)  # (1, 1)
+            generated_tokens.append(token)
+            past_kv = outputs.past_key_values
+
         # Combine: codebook-0 + codebooks 1..Q-1
-        remaining_ids = predictor_result.sequences[:, -num_groups + 1:]  # (1, Q-1)
-        all_ids = torch.cat([first_token, remaining_ids], dim=-1)  # (1, Q)
+        remaining = torch.cat(generated_tokens, dim=-1)  # (1, Q-1)
+        all_ids = torch.cat([first_token, remaining], dim=-1)  # (1, Q)
 
         return all_ids.squeeze(0)  # (Q,)
+
+    def _sample_cp_token(self, logits: torch.Tensor, request) -> torch.Tensor:
+        """Sample a single token for code_predictor (lightweight, no repetition penalty).
+
+        Args:
+            logits: (1, vocab_size) raw logits.
+            request: TTSRequest with subtalker sampling parameters.
+
+        Returns:
+            (1, 1) sampled token ID.
+        """
+        if not request.subtalker_dosample:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        if request.subtalker_temperature > 0 and request.subtalker_temperature != 1.0:
+            logits = logits / request.subtalker_temperature
+
+        if request.subtalker_top_k > 0:
+            top_k = min(request.subtalker_top_k, logits.size(-1))
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits = logits.masked_fill(indices_to_remove, float("-inf"))
+
+        if request.subtalker_top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > request.subtalker_top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            logits = logits.masked_fill(indices_to_remove, float("-inf"))
+
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)  # (1, 1)
 
     def _sample_token(
         self,
