@@ -35,6 +35,12 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
     - [Tokenizer Encode and Decode](#tokenizer-encode-and-decode)
   - [Launch Local Web UI Demo](#launch-local-web-ui-demo)
   - [DashScope API Usage](#dashscope-api-usage)
+- [Continuous Batching Engine](#continuous-batching-engine)
+  - [Basic Usage](#basic-usage)
+  - [Voice Clone with Continuous Batching](#voice-clone-with-continuous-batching)
+  - [Background Generation](#background-generation)
+  - [API Reference](#api-reference)
+- [torch.compile Acceleration](#torchcompile-acceleration)
 - [vLLM Usage](#vllm-usage)
 - [Fine Tuning](#fine-tuning)
 - [Evaluation](#evaluation)
@@ -427,6 +433,197 @@ To further explore Qwen3-TTS, we encourage you to try our DashScope API for a fa
 | Real-time API for Qwen3-TTS of custom voice model. | [https://help.aliyun.com/zh/model-studio/qwen-tts-realtime](https://help.aliyun.com/zh/model-studio/qwen-tts-realtime) | [https://www.alibabacloud.com/help/en/model-studio/qwen-tts-realtime](https://www.alibabacloud.com/help/en/model-studio/qwen-tts-realtime) |
 | Real-time API for Qwen3-TTS of voice clone model. | [https://help.aliyun.com/zh/model-studio/qwen-tts-voice-cloning](https://help.aliyun.com/zh/model-studio/qwen-tts-voice-cloning) | [https://www.alibabacloud.com/help/en/model-studio/qwen-tts-voice-cloning](https://www.alibabacloud.com/help/en/model-studio/qwen-tts-voice-cloning) |
 | Real-time API for Qwen3-TTS of voice design model. | [https://help.aliyun.com/zh/model-studio/qwen-tts-voice-design](https://help.aliyun.com/zh/model-studio/qwen-tts-voice-design) | [https://www.alibabacloud.com/help/en/model-studio/qwen-tts-voice-design](https://www.alibabacloud.com/help/en/model-studio/qwen-tts-voice-design) |
+
+
+## Continuous Batching Engine
+
+The `ContinuousBatchingEngine` provides a custom generation loop that bypasses HuggingFace `GenerationMixin.generate()`, enabling:
+
+- **Dynamic request insertion**: add new requests while generation is running.
+- **Early completion**: short requests finish and release resources immediately, without waiting for longer requests.
+- **Per-request KV cache management**: each request maintains its own KV cache, assembled into a batch for efficient decode.
+- **Optional `torch.compile`**: compile core compute components for additional speedup.
+
+### Basic Usage
+
+```python
+import torch
+import soundfile as sf
+from qwen_tts import ContinuousBatchingEngine, TTSRequest, GenerationMode
+
+engine = ContinuousBatchingEngine.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    max_batch_size=16,
+    enable_compile=False,  # set True to enable torch.compile
+    device_map="cuda:0",
+    torch_dtype=torch.bfloat16,
+)
+
+# Submit multiple requests
+engine.add_request(TTSRequest(
+    request_id="r1",
+    mode=GenerationMode.CUSTOM_VOICE,
+    text="其实我真的有发现，我是一个特别善于观察别人情绪的人。",
+    language="Chinese",
+    speaker="Vivian",
+))
+engine.add_request(TTSRequest(
+    request_id="r2",
+    mode=GenerationMode.CUSTOM_VOICE,
+    text="Hello world, this is a test of the continuous batching engine.",
+    language="English",
+    speaker="Ryan",
+))
+
+# Run generation (blocking). Short requests finish first and release GPU memory.
+engine.run()
+
+# Retrieve results
+wav1, sr = engine.get_result("r1")
+wav2, sr = engine.get_result("r2")
+sf.write("output_r1.wav", wav1, sr)
+sf.write("output_r2.wav", wav2, sr)
+```
+
+### Voice Clone with Continuous Batching
+
+To use voice clone mode, first build a `voice_clone_prompt` using the standard `Qwen3TTSModel` API, then pass it to a `TTSRequest`:
+
+```python
+from qwen_tts import Qwen3TTSModel, ContinuousBatchingEngine, TTSRequest, GenerationMode
+
+# Build voice clone prompt using the standard API
+tts = Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    device_map="cuda:0",
+    dtype=torch.bfloat16,
+)
+
+prompt_items = tts.create_voice_clone_prompt(
+    ref_audio="path/to/reference.wav",
+    ref_text="The transcript of the reference audio.",
+)
+
+# Create engine from the same underlying model
+engine = ContinuousBatchingEngine(
+    model=tts.model,
+    processor=tts.processor,
+    max_batch_size=8,
+)
+
+engine.add_request(TTSRequest(
+    request_id="clone1",
+    mode=GenerationMode.VOICE_CLONE,
+    text="New sentence in the cloned voice.",
+    language="English",
+    voice_clone_prompt=prompt_items[0],  # dict with ref_spk_embedding, ref_code, etc.
+    ref_text="The transcript of the reference audio.",
+))
+
+engine.run()
+wav, sr = engine.get_result("clone1")
+```
+
+### Background Generation
+
+For server-like scenarios, start a background thread and submit requests dynamically:
+
+```python
+engine.start_background()
+
+# Submit requests at any time from any thread
+r1 = engine.add_request(TTSRequest(
+    request_id="dynamic1",
+    mode=GenerationMode.CUSTOM_VOICE,
+    text="First request.",
+    language="English",
+    speaker="Ryan",
+))
+
+# Block until result is ready
+wav, sr = engine.wait_for_result("dynamic1", timeout=60)
+
+# Later, add more requests while generation is running
+r2 = engine.add_request(TTSRequest(
+    request_id="dynamic2",
+    mode=GenerationMode.CUSTOM_VOICE,
+    text="Second request, submitted while the first was generating.",
+    language="English",
+    speaker="Aiden",
+))
+wav2, sr = engine.wait_for_result("dynamic2", timeout=60)
+
+# Shut down when done
+engine.stop_background()
+```
+
+### API Reference
+
+**`TTSRequest`** fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `request_id` | `str` | required | Unique request identifier |
+| `mode` | `GenerationMode` | required | `CUSTOM_VOICE`, `VOICE_DESIGN`, or `VOICE_CLONE` |
+| `text` | `str` | required | Text to synthesize |
+| `language` | `str` | `"Auto"` | Target language (`"Chinese"`, `"English"`, etc.) |
+| `speaker` | `str` | `None` | Speaker name (for `CUSTOM_VOICE` mode) |
+| `instruct` | `str` | `None` | Style instruction (for `CUSTOM_VOICE` / `VOICE_DESIGN`) |
+| `voice_clone_prompt` | `dict` | `None` | Voice clone prompt dict (for `VOICE_CLONE` mode) |
+| `ref_text` | `str` | `None` | Reference transcript (for `VOICE_CLONE` ICL mode) |
+| `non_streaming_mode` | `bool` | `False` | Use non-streaming text input mode |
+| `max_new_tokens` | `int` | `2048` | Maximum generated codec tokens |
+| `do_sample` | `bool` | `True` | Enable sampling |
+| `top_k` | `int` | `50` | Top-k sampling |
+| `top_p` | `float` | `1.0` | Top-p (nucleus) sampling |
+| `temperature` | `float` | `0.9` | Sampling temperature |
+| `repetition_penalty` | `float` | `1.05` | Repetition penalty |
+
+**`ContinuousBatchingEngine`** methods:
+
+| Method | Description |
+|--------|-------------|
+| `from_pretrained(model_path, ...)` | Load model and create engine |
+| `add_request(request)` | Submit a request (thread-safe) |
+| `run()` | Run generation loop (blocking) |
+| `start_background()` / `stop_background()` | Run generation in a background thread |
+| `get_result(request_id)` | Get result `(waveform, sample_rate)` if completed |
+| `is_complete(request_id)` | Check if request has completed |
+| `wait_for_result(request_id, timeout)` | Block until request completes |
+
+
+## torch.compile Acceleration
+
+You can apply `torch.compile` to accelerate inference for both the standard `Qwen3TTSModel` API and the `ContinuousBatchingEngine`. This compiles the core compute-heavy sub-components while leaving dynamic-control-flow components uncompiled:
+
+**Compiled components**: `talker.model` (backbone), `talker.code_predictor.model`, `speaker_encoder` (base model only), `speech_tokenizer.decoder.forward`, `talker.text_projection`, `talker.codec_head`.
+
+```python
+# Option 1: With Qwen3TTSModel
+from qwen_tts import Qwen3TTSModel
+
+model = Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    device_map="cuda:0",
+    dtype=torch.bfloat16,
+)
+model.enable_compile()  # applies torch.compile to compatible components
+
+# Then use model.generate_custom_voice() / generate_voice_clone() as usual.
+# The first call will be slower due to compilation; subsequent calls are faster.
+```
+
+```python
+# Option 2: With ContinuousBatchingEngine
+engine = ContinuousBatchingEngine.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    enable_compile=True,  # compiles during engine construction
+    device_map="cuda:0",
+    torch_dtype=torch.bfloat16,
+)
+```
+
+> **Note**: `torch.compile` requires PyTorch 2.0+. The first generation call incurs a one-time compilation overhead. Use `mode="reduce-overhead"` (default) for the best latency improvement on repeated calls. If you encounter compatibility issues, try `mode="default"` or disable compilation.
 
 
 ## vLLM Usage

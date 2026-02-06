@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from pathlib import Path
 import time
 import torch
 import soundfile as sf
@@ -33,7 +34,10 @@ def run_case(tts: Qwen3TTSModel, out_dir: str, case_name: str, call_fn):
 
     torch.cuda.synchronize()
     t1 = time.time()
-    print(f"[{case_name}] time: {t1 - t0:.3f}s, n_wavs={len(wavs)}, sr={sr}")
+    gen_time = t1 - t0
+    total_duration = sum(len(w) / sr for w in wavs)
+    rtf = gen_time / total_duration if total_duration > 0 else float('inf')
+    print(f"[{case_name}] time: {gen_time:.3f}s, audio_duration: {total_duration:.3f}s, RTF: {rtf:.3f}, n_wavs={len(wavs)}, sr={sr}")
 
     for i, w in enumerate(wavs):
         sf.write(os.path.join(out_dir, f"{case_name}_{i}.wav"), w, sr)
@@ -41,7 +45,7 @@ def run_case(tts: Qwen3TTSModel, out_dir: str, case_name: str, call_fn):
 
 def main():
     device = "cuda:0"
-    MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-Base/"
+    MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     OUT_DIR = "qwen3_tts_test_voice_clone_output_wav"
     ensure_dir(OUT_DIR)
 
@@ -49,12 +53,12 @@ def main():
         MODEL_PATH,
         device_map=device,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
 
     # Reference audio(s)
-    ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-    ref_audio_path_2 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_1.wav"
+    ref_audio_path_1 = str(Path(__file__).resolve().parent / "clone_1.wav")
+    ref_audio_path_2 = str(Path(__file__).resolve().parent / "clone_2.wav")
 
     ref_audio_single = ref_audio_path_1
     ref_audio_batch = [ref_audio_path_1, ref_audio_path_2]

@@ -7,7 +7,7 @@ name = "qwen-tts"
 version = "0.1.1"
 description = "Qwen-TTS python package"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
@@ -29,6 +29,8 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "fastapi>=0.100",
+  "uvicorn[standard]>=0.20",
 ]
 
 [project.urls]
@@ -37,6 +39,7 @@ Repository = "https://github.com/Qwen/Qwen3-TTS"
 
 [project.scripts]
 qwen-tts-demo = "qwen_tts.cli.demo:main"
+qwen-tts-serve = "qwen_tts.server.app:main"
 
 [tool.setuptools]
 packages = { find = { where = ["."] , include = ["qwen_tts*"] } }

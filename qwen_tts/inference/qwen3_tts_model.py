@@ -858,6 +858,21 @@ class Qwen3TTSModel:
         return sorted(supported)
 
 
+    def enable_compile(self, backend="inductor", mode="reduce-overhead") -> "Qwen3TTSModel":
+        """Apply torch.compile to compatible sub-components for inference speedup.
+
+        Args:
+            backend: torch.compile backend (default: "inductor").
+            mode: torch.compile mode (default: "reduce-overhead").
+
+        Returns:
+            self, for method chaining.
+        """
+        from .compile_utils import apply_torch_compile
+
+        apply_torch_compile(self.model, backend=backend, mode=mode)
+        return self
+
     def get_supported_languages(self) -> Optional[List[str]]:
         """
         List supported language names for the current model.
